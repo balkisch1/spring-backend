@@ -18,22 +18,34 @@ public class LigneReservation {
     @JoinColumn(name = "reservation_id", nullable = false)
     private Reservation reservation;
 
+    // ── Mode Hôtel ─────────────────────────────────────────────
     @ManyToOne(fetch = FetchType.EAGER)
-    @JoinColumn(name = "chambre_id", nullable = false)
+    @JoinColumn(name = "chambre_id")
     private Chambre chambre;
 
-    @Column(nullable = false)
     private LocalDate dateArrivee;
-
-    @Column(nullable = false)
     private LocalDate dateDepart;
-
-    @Column(nullable = false)
     private Integer nombreNuits;
 
+    // ── Mode Transport ─────────────────────────────────────────
+    @ManyToOne(fetch = FetchType.EAGER)
+    @JoinColumn(name = "trajet_id")
+    private Trajet trajet;
+
+    private Integer nombrePlaces;
+
+    // ── Commun ─────────────────────────────────────────────────
     @Column(nullable = false, precision = 10, scale = 2)
     private BigDecimal prixUnitaire;
 
     @Column(nullable = false, precision = 10, scale = 2)
     private BigDecimal sousTotal;
+
+    @Enumerated(EnumType.STRING)
+    @Column(nullable = false)
+    private TypeLigne typeLigne;
+
+    public enum TypeLigne {
+        HOTEL, TRANSPORT
+    }
 }

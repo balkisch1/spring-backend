@@ -21,15 +21,24 @@ public class ReservationService {
     private final ReservationRepository reservationRepository;
     private final ChambreRepository chambreRepository;
     private final ClientRepository clientRepository;
+    private final TrajetRepository trajetRepository;
+    private final NotificationService notificationService;
+
+    // ── Records utilisés par le Controller ────────────────────────────────────
+    public record LigneHotelRequest(Long chambreId, LocalDate dateArrivee, LocalDate dateDepart) {}
+    public record LigneTransportRequest(Long trajetId, int nombrePlaces) {}
+
+    // ── HOTEL ─────────────────────────────────────────────────────────────────
 
     /**
-     * Créer une réservation avec gestion des transactions et Optimistic Locking.
-     * Si 2 clients réservent la même chambre simultanément, une exception sera levée.
+     * Créer une réservation HÔTEL avec Optimistic Locking (@Version sur Chambre).
+     * Si 2 clients réservent la même chambre simultanément, une OptimisticLockException
+     * est levée et la transaction est rollback automatiquement.
      */
     @Transactional(rollbackFor = Exception.class)
-    public Reservation creerReservation(Long clientId, List<Long> chambreIds,
-                                        List<LocalDate> datesArrivee, List<LocalDate> datesDepart,
-                                        String commentaire) {
+    public Reservation creerReservationHotel(Long clientId,
+                                             List<LigneHotelRequest> lignes,
+                                             String commentaire) {
         Client client = clientRepository.findById(clientId)
                 .orElseThrow(() -> new RuntimeException("Client non trouvé"));
 
@@ -42,64 +51,147 @@ public class ReservationService {
                 .build();
 
         reservationRepository.save(reservation);
-
         BigDecimal total = BigDecimal.ZERO;
 
-        for (int i = 0; i < chambreIds.size(); i++) {
-            Chambre chambre = chambreRepository.findById(chambreIds.get(i))
-                    .orElseThrow(() -> new RuntimeException("Chambre non trouvée"));
+        for (LigneHotelRequest req : lignes) {
+            Chambre chambre = chambreRepository.findById(req.chambreId())
+                    .orElseThrow(() -> new RuntimeException("Chambre non trouvée : " + req.chambreId()));
 
-            // Vérifier disponibilité (optimistic locking via @Version)
-            List<Chambre> disponibles = chambreRepository.findChambresDisponibles(
-                    datesArrivee.get(i), datesDepart.get(i)
+            // Vérifier disponibilité via JPQL (Optimistic Locking via @Version sur Chambre)
+            List<Chambre> dispo = chambreRepository.findChambresDisponibles(
+                    req.dateArrivee(), req.dateDepart()
             );
-
-            boolean estDisponible = disponibles.stream()
-                    .anyMatch(c -> c.getId().equals(chambre.getId()));
-
-            if (!estDisponible) {
+            boolean disponible = dispo.stream().anyMatch(c -> c.getId().equals(chambre.getId()));
+            if (!disponible)
                 throw new RuntimeException("Chambre " + chambre.getNumero() + " non disponible pour cette période");
-            }
 
-            long nombreNuits = ChronoUnit.DAYS.between(datesArrivee.get(i), datesDepart.get(i));
-            if (nombreNuits <= 0) throw new RuntimeException("Dates invalides");
+            long nuits = ChronoUnit.DAYS.between(req.dateArrivee(), req.dateDepart());
+            if (nuits <= 0) throw new RuntimeException("Dates invalides");
 
-            BigDecimal sousTotal = chambre.getPrixParNuit().multiply(BigDecimal.valueOf(nombreNuits));
+            BigDecimal sousTotal = chambre.getPrixParNuit().multiply(BigDecimal.valueOf(nuits));
 
-            LigneReservation ligne = LigneReservation.builder()
+            reservation.getLignesReservation().add(LigneReservation.builder()
                     .reservation(reservation)
                     .chambre(chambre)
-                    .dateArrivee(datesArrivee.get(i))
-                    .dateDepart(datesDepart.get(i))
-                    .nombreNuits((int) nombreNuits)
+                    .dateArrivee(req.dateArrivee())
+                    .dateDepart(req.dateDepart())
+                    .nombreNuits((int) nuits)
                     .prixUnitaire(chambre.getPrixParNuit())
                     .sousTotal(sousTotal)
-                    .build();
+                    .typeLigne(LigneReservation.TypeLigne.HOTEL)
+                    .build());
 
-            reservation.getLignesReservation().add(ligne);
             total = total.add(sousTotal);
         }
 
         reservation.setPrixTotal(total);
-        return reservationRepository.save(reservation);
+        Reservation saved = reservationRepository.save(reservation);
+
+        // 🔔 Notification automatique au client
+        notificationService.notifierReservationCreee(saved);
+        return saved;
     }
+
+    // ── TRANSPORT ─────────────────────────────────────────────────────────────
+
+    /**
+     * Créer une réservation TRANSPORT avec Pessimistic Locking.
+     * La ligne trajet est verrouillée en base pendant toute la transaction
+     * pour éviter la survente de places (2 clients ne peuvent pas réserver
+     * la même place en même temps).
+     */
+    @Transactional(rollbackFor = Exception.class)
+    public Reservation creerReservationTransport(Long clientId,
+                                                 List<LigneTransportRequest> lignes,
+                                                 String commentaire) {
+        Client client = clientRepository.findById(clientId)
+                .orElseThrow(() -> new RuntimeException("Client non trouvé"));
+
+        Reservation reservation = Reservation.builder()
+                .client(client)
+                .statut(Reservation.StatutReservation.EN_ATTENTE)
+                .commentaire(commentaire)
+                .prixTotal(BigDecimal.ZERO)
+                .lignesReservation(new ArrayList<>())
+                .build();
+
+        reservationRepository.save(reservation);
+        BigDecimal total = BigDecimal.ZERO;
+
+        for (LigneTransportRequest req : lignes) {
+            Trajet trajet = trajetRepository.findById(req.trajetId())
+                    .orElseThrow(() -> new RuntimeException("Trajet non trouvé : " + req.trajetId()));
+
+            if (!trajet.getActif())
+                throw new RuntimeException("Ce trajet n'est plus actif");
+
+            if (trajet.getPlacesDisponibles() < req.nombrePlaces())
+                throw new RuntimeException("Seulement " + trajet.getPlacesDisponibles() + " place(s) disponible(s)");
+
+            // Décrémentation atomique via @Modifying JPQL (Pessimistic Lock)
+            int updated = trajetRepository.decrementersPlaces(trajet.getId(), req.nombrePlaces());
+            if (updated == 0)
+                throw new RuntimeException("Conflit concurrent : places insuffisantes, veuillez réessayer");
+
+            BigDecimal sousTotal = trajet.getPrixParPlace().multiply(BigDecimal.valueOf(req.nombrePlaces()));
+
+            reservation.getLignesReservation().add(LigneReservation.builder()
+                    .reservation(reservation)
+                    .trajet(trajet)
+                    .nombrePlaces(req.nombrePlaces())
+                    .prixUnitaire(trajet.getPrixParPlace())
+                    .sousTotal(sousTotal)
+                    .typeLigne(LigneReservation.TypeLigne.TRANSPORT)
+                    .build());
+
+            total = total.add(sousTotal);
+        }
+
+        reservation.setPrixTotal(total);
+        Reservation saved = reservationRepository.save(reservation);
+
+        // 🔔 Notification automatique au client
+        notificationService.notifierReservationCreee(saved);
+        return saved;
+    }
+
+    // ── ACTIONS COMMUNES ──────────────────────────────────────────────────────
 
     @Transactional
     public Reservation confirmerReservation(Long id) {
         Reservation reservation = getReservationById(id);
         reservation.setStatut(Reservation.StatutReservation.CONFIRMEE);
-        return reservationRepository.save(reservation);
+        Reservation saved = reservationRepository.save(reservation);
+
+        // 🔔 Notification de confirmation
+        notificationService.notifierReservationConfirmee(saved);
+        return saved;
     }
 
     @Transactional
     public Reservation annulerReservation(Long id) {
         Reservation reservation = getReservationById(id);
-        if (reservation.getStatut() == Reservation.StatutReservation.TERMINEE) {
+
+        if (reservation.getStatut() == Reservation.StatutReservation.TERMINEE)
             throw new RuntimeException("Impossible d'annuler une réservation terminée");
+
+        // Libérer les places transport si applicable (rollback métier)
+        for (LigneReservation ligne : reservation.getLignesReservation()) {
+            if (LigneReservation.TypeLigne.TRANSPORT.equals(ligne.getTypeLigne())
+                    && ligne.getTrajet() != null) {
+                trajetRepository.incrementerPlaces(ligne.getTrajet().getId(), ligne.getNombrePlaces());
+            }
         }
+
         reservation.setStatut(Reservation.StatutReservation.ANNULEE);
-        return reservationRepository.save(reservation);
+        Reservation saved = reservationRepository.save(reservation);
+
+        // 🔔 Notification d'annulation
+        notificationService.notifierReservationAnnulee(saved);
+        return saved;
     }
+
+    // ── LECTURE ───────────────────────────────────────────────────────────────
 
     @Transactional(readOnly = true)
     public Reservation getReservationById(Long id) {
@@ -124,6 +216,7 @@ public class ReservationService {
             put("reservationsEnAttente", reservationRepository.countReservationsEnAttente());
             put("totalClients", clientRepository.count());
             put("totalChambres", chambreRepository.count());
+            put("totalTrajets", trajetRepository.countTrajetsActifs());
             put("revenuTotal", reservationRepository.totalRevenu());
         }};
     }
